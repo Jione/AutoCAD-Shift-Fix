@@ -1,0 +1,40 @@
+#include <windows.h>
+#define PRODUCT_NAME "Key Repeat Tester"
+#define DESCRIPTION  "Check Held-Key Repeat Status"
+#define ORIGIN_NAME  "KeyRepeatTester.exe"
+#define FILE_VERSION "1.0.0.0"
+#define COPYRIGHT    "Jiwon Kim"
+
+LANGUAGE LANG_ENGLISH, SUBLANG_ENGLISH_US
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION 1,0,0,0
+ PRODUCTVERSION 1,0,0,0
+ FILEFLAGSMASK 0x3fL
+#ifdef _DEBUG
+ FILEFLAGS 0x1L
+#else
+ FILEFLAGS 0x0L
+#endif
+ FILEOS 0x40004L
+ FILETYPE 0x1L
+ FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "FileDescription",  DESCRIPTION
+            VALUE "FileVersion",      FILE_VERSION
+            VALUE "InternalName",     ORIGIN_NAME
+            VALUE "OriginalFilename", ORIGIN_NAME
+            VALUE "ProductName",      PRODUCT_NAME
+            VALUE "ProductVersion",   FILE_VERSION
+            VALUE "LegalCopyright",   COPYRIGHT
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END
