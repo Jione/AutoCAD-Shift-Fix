@@ -44,6 +44,8 @@ namespace KeyRepeatAssist
     static std::atomic<ULONGLONG> g_gateEpoch(0);
     static std::atomic<ULONGLONG> g_inputEpoch(0);
 
+    static const ULONG_PTR kAssistExtraInfo = 0x53485250UL;
+
     static HHOOK g_keyboardHook = NULL;
     static HANDLE g_singleInstanceMutex = NULL;
 
@@ -371,7 +373,7 @@ namespace KeyRepeatAssist
             input.ki.wScan = m_scanCode;
             input.ki.dwFlags = KEYEVENTF_SCANCODE | m_inputFlags;
             input.ki.time = 0;
-            input.ki.dwExtraInfo = GetMessageExtraInfo();
+            input.ki.dwExtraInfo = kAssistExtraInfo;
 
             UINT sentCount = SendInput(1, &input, sizeof(INPUT));
             ULONGLONG sendEndCounter = ReadCounter();
@@ -469,7 +471,7 @@ namespace KeyRepeatAssist
                 m_inputFlags;
 
             input.ki.time = 0;
-            input.ki.dwExtraInfo = GetMessageExtraInfo();
+            input.ki.dwExtraInfo = kAssistExtraInfo;
 
             SendInput(1, &input, sizeof(INPUT));
         }
@@ -647,9 +649,9 @@ namespace KeyRepeatAssist
         return NULL;
     }
 
-    static bool IsInjectedKeyboardEvent(const KBDLLHOOKSTRUCT* keyInfo)
+    static bool IsSelfInjectedKeyboardEvent(const KBDLLHOOKSTRUCT* keyInfo)
     {
-        return (keyInfo->flags & LLKHF_INJECTED) != 0;
+        return keyInfo->dwExtraInfo == kAssistExtraInfo;
     }
 
     static bool IsKeyDownMessage(WPARAM messageValue)
@@ -699,7 +701,7 @@ namespace KeyRepeatAssist
             const KBDLLHOOKSTRUCT* keyInfo =
                 reinterpret_cast<const KBDLLHOOKSTRUCT*>(lParam);
 
-            if (!IsInjectedKeyboardEvent(keyInfo))
+            if (!IsSelfInjectedKeyboardEvent(keyInfo))
             {
                 ULONGLONG hookCounter = ReadCounter();
 
