@@ -35,7 +35,8 @@ namespace KeyRepeatAssist
         HWND startWindow;
     };
 
-    static const bool kCorrectOverlappedSend = false;
+    static const DWORD kVirtualUpDelayMs = 10;
+    static const DWORD kVirtualUpRetryMs = 10;
 
     static const wchar_t* kSingleInstanceMutexName =
         L"Local\\KeyRepeatAssist_SingleInstance";
@@ -51,13 +52,6 @@ namespace KeyRepeatAssist
 
     static KeyboardTimingConfig g_timing = {};
 
-    static ULONGLONG ReadCounter()
-    {
-        LARGE_INTEGER value = {};
-        QueryPerformanceCounter(&value);
-        return static_cast<ULONGLONG>(value.QuadPart);
-    }
-
     class RepeatKeyWorker
     {
     public:
@@ -71,10 +65,11 @@ namespace KeyRepeatAssist
             m_periodMs(90),
             m_stopRequested(false),
             m_physicalDown(false),
-            m_correctionUpPending(false),
+            m_virtualDownActive(false),
+            m_virtualUpPending(false),
+            m_virtualUpDueTick(0),
             m_keyEpoch(0),
-            m_startWindowValue(0),
-            m_lastPhysicalUpCounter(0)
+            m_startWindowValue(0)
         {
         }
 
@@ -88,10 +83,11 @@ namespace KeyRepeatAssist
             m_periodMs.store(periodMs, std::memory_order_release);
             m_stopRequested.store(false, std::memory_order_release);
             m_physicalDown.store(false, std::memory_order_release);
-            m_correctionUpPending.store(false, std::memory_order_release);
+            m_virtualDownActive.store(false, std::memory_order_release);
+            m_virtualUpPending.store(false, std::memory_order_release);
+            m_virtualUpDueTick.store(0, std::memory_order_release);
             m_keyEpoch.store(0, std::memory_order_release);
             m_startWindowValue.store(0, std::memory_order_release);
-            m_lastPhysicalUpCounter.store(0, std::memory_order_release);
 
             m_wakeEvent = CreateEventW(NULL, FALSE, FALSE, NULL);
             if (m_wakeEvent == NULL)
@@ -155,20 +151,22 @@ namespace KeyRepeatAssist
                 reinterpret_cast<ULONG_PTR>(foregroundWindow),
                 std::memory_order_release);
 
-            m_lastPhysicalUpCounter.store(0, std::memory_order_release);
-            m_correctionUpPending.store(false, std::memory_order_release);
             m_physicalDown.store(true, std::memory_order_release);
             m_keyEpoch.fetch_add(1, std::memory_order_acq_rel);
 
             Wake();
         }
 
-        void NotifyPhysicalUp(ULONGLONG hookCounter)
+        void NotifyPhysicalUp()
         {
-            m_lastPhysicalUpCounter.store(hookCounter, std::memory_order_release);
             m_physicalDown.store(false, std::memory_order_release);
             m_startWindowValue.store(0, std::memory_order_release);
             m_keyEpoch.fetch_add(1, std::memory_order_acq_rel);
+
+            if (m_virtualDownActive.load(std::memory_order_acquire))
+            {
+                ScheduleVirtualUp(kVirtualUpDelayMs);
+            }
 
             Wake();
         }
@@ -185,24 +183,64 @@ namespace KeyRepeatAssist
         {
             while (!m_stopRequested.load(std::memory_order_acquire))
             {
-                WaitForSingleObject(m_wakeEvent, INFINITE);
+                FlushVirtualUpIfDue();
+
+                DWORD waitMs = GetThreadWaitMs();
+                WaitForSingleObject(m_wakeEvent, waitMs);
 
                 if (m_stopRequested.load(std::memory_order_acquire))
                 {
                     break;
                 }
 
+                FlushVirtualUpIfDue();
                 ProcessCurrentState();
             }
 
-            FlushCorrectionUpIfNeeded();
+            if (m_virtualDownActive.load(std::memory_order_acquire))
+            {
+                SendSyntheticUp();
+                m_virtualDownActive.store(false, std::memory_order_release);
+                m_virtualUpPending.store(false, std::memory_order_release);
+                m_virtualUpDueTick.store(0, std::memory_order_release);
+            }
+        }
+
+        DWORD GetThreadWaitMs() const
+        {
+            if (!m_virtualUpPending.load(std::memory_order_acquire))
+            {
+                return INFINITE;
+            }
+
+            ULONGLONG nowTick = GetTickCount64();
+            ULONGLONG dueTick =
+                m_virtualUpDueTick.load(std::memory_order_acquire);
+
+            if (nowTick >= dueTick)
+            {
+                return 0;
+            }
+
+            ULONGLONG delta = dueTick - nowTick;
+            if (delta > 0x7FFFFFFFUL)
+            {
+                return 0x7FFFFFFF;
+            }
+
+            return static_cast<DWORD>(delta);
         }
 
         void ProcessCurrentState()
         {
             while (!m_stopRequested.load(std::memory_order_acquire))
             {
-                FlushCorrectionUpIfNeeded();
+                FlushVirtualUpIfDue();
+
+                if (m_virtualUpPending.load(std::memory_order_acquire))
+                {
+                    return;
+                }
 
                 if (!m_physicalDown.load(std::memory_order_acquire))
                 {
@@ -225,7 +263,12 @@ namespace KeyRepeatAssist
                     return;
                 }
 
-                FlushCorrectionUpIfNeeded();
+                FlushVirtualUpIfDue();
+
+                if (m_virtualUpPending.load(std::memory_order_acquire))
+                {
+                    return;
+                }
 
                 if (waitResult == WAIT_OBJECT_0)
                 {
@@ -246,7 +289,12 @@ namespace KeyRepeatAssist
         {
             while (!m_stopRequested.load(std::memory_order_acquire))
             {
-                FlushCorrectionUpIfNeeded();
+                FlushVirtualUpIfDue();
+
+                if (m_virtualUpPending.load(std::memory_order_acquire))
+                {
+                    return;
+                }
 
                 if (!IsSnapshotValid(snapshot))
                 {
@@ -267,7 +315,12 @@ namespace KeyRepeatAssist
                     return;
                 }
 
-                FlushCorrectionUpIfNeeded();
+                FlushVirtualUpIfDue();
+
+                if (m_virtualUpPending.load(std::memory_order_acquire))
+                {
+                    return;
+                }
 
                 if (waitResult == WAIT_OBJECT_0)
                 {
@@ -305,6 +358,11 @@ namespace KeyRepeatAssist
             }
 
             if (!m_physicalDown.load(std::memory_order_acquire))
+            {
+                return false;
+            }
+
+            if (m_virtualUpPending.load(std::memory_order_acquire))
             {
                 return false;
             }
@@ -360,8 +418,6 @@ namespace KeyRepeatAssist
                 return false;
             }
 
-            ULONGLONG sendBeginCounter = ReadCounter();
-
             if (!IsSnapshotValid(snapshot))
             {
                 return false;
@@ -376,12 +432,12 @@ namespace KeyRepeatAssist
             input.ki.dwExtraInfo = kAssistExtraInfo;
 
             UINT sentCount = SendInput(1, &input, sizeof(INPUT));
-            ULONGLONG sendEndCounter = ReadCounter();
-
             if (sentCount != 1)
             {
                 return false;
             }
+
+            m_virtualDownActive.store(true, std::memory_order_release);
 
             ULONGLONG afterGateEpoch =
                 g_gateEpoch.load(std::memory_order_acquire);
@@ -397,70 +453,80 @@ namespace KeyRepeatAssist
                 afterInputEpoch != beforeInputEpoch ||
                 afterKeyEpoch != beforeKeyEpoch;
 
+            if (!m_physicalDown.load(std::memory_order_acquire))
+            {
+                ScheduleVirtualUp(kVirtualUpDelayMs);
+                return false;
+            }
+
+            if ((GetAsyncKeyState(static_cast<int>(m_vkCode)) & 0x8000) == 0)
+            {
+                ScheduleVirtualUp(kVirtualUpDelayMs);
+                return false;
+            }
+
             if (changedDuringSend)
             {
-                RequestCorrectionIfSendAfterPhysicalUp(
-                    sendBeginCounter,
-                    sendEndCounter);
                 return false;
             }
 
             if (!IsSnapshotValid(snapshot))
             {
-                RequestCorrectionIfSendAfterPhysicalUp(
-                    sendBeginCounter,
-                    sendEndCounter);
                 return false;
             }
 
             return true;
         }
 
-        void RequestCorrectionIfSendAfterPhysicalUp(
-            ULONGLONG sendBeginCounter,
-            ULONGLONG sendEndCounter)
+        void ScheduleVirtualUp(DWORD delayMs)
         {
-            if (m_physicalDown.load(std::memory_order_acquire))
+            if (!m_virtualDownActive.load(std::memory_order_acquire))
             {
                 return;
             }
 
-            ULONGLONG physicalUpCounter =
-                m_lastPhysicalUpCounter.load(std::memory_order_acquire);
+            ULONGLONG dueTick = GetTickCount64() + delayMs;
 
-            if (physicalUpCounter == 0)
-            {
-                return;
-            }
+            m_virtualUpDueTick.store(dueTick, std::memory_order_release);
+            m_virtualUpPending.store(true, std::memory_order_release);
 
-            bool clearlyAfterUp = sendBeginCounter >= physicalUpCounter;
-            bool overlappedWithUp =
-                sendBeginCounter < physicalUpCounter &&
-                sendEndCounter >= physicalUpCounter;
-
-            if (clearlyAfterUp || (kCorrectOverlappedSend && overlappedWithUp))
-            {
-                m_correctionUpPending.store(true, std::memory_order_release);
-                Wake();
-            }
+            Wake();
         }
 
-        void FlushCorrectionUpIfNeeded()
+        bool FlushVirtualUpIfDue()
         {
-            if (m_physicalDown.load(std::memory_order_acquire))
+            if (!m_virtualUpPending.load(std::memory_order_acquire))
             {
-                m_correctionUpPending.store(false, std::memory_order_release);
-                return;
+                return false;
             }
 
-            bool needCorrection =
-                m_correctionUpPending.exchange(false, std::memory_order_acq_rel);
+            ULONGLONG nowTick = GetTickCount64();
+            ULONGLONG dueTick =
+                m_virtualUpDueTick.load(std::memory_order_acquire);
 
-            if (!needCorrection)
+            if (nowTick < dueTick)
             {
-                return;
+                return false;
             }
 
+            if (SendSyntheticUp())
+            {
+                m_virtualDownActive.store(false, std::memory_order_release);
+                m_virtualUpPending.store(false, std::memory_order_release);
+                m_virtualUpDueTick.store(0, std::memory_order_release);
+                return true;
+            }
+
+            m_virtualUpDueTick.store(
+                GetTickCount64() + kVirtualUpRetryMs,
+                std::memory_order_release);
+
+            Wake();
+            return false;
+        }
+
+        bool SendSyntheticUp()
+        {
             INPUT input = {};
             input.type = INPUT_KEYBOARD;
             input.ki.wVk = 0;
@@ -473,7 +539,8 @@ namespace KeyRepeatAssist
             input.ki.time = 0;
             input.ki.dwExtraInfo = kAssistExtraInfo;
 
-            SendInput(1, &input, sizeof(INPUT));
+            UINT sentCount = SendInput(1, &input, sizeof(INPUT));
+            return sentCount == 1;
         }
 
         void CancelHoldIfForegroundChanged(HWND startWindow)
@@ -491,6 +558,11 @@ namespace KeyRepeatAssist
             m_physicalDown.store(false, std::memory_order_release);
             m_keyEpoch.fetch_add(1, std::memory_order_acq_rel);
             m_startWindowValue.store(0, std::memory_order_release);
+
+            if (m_virtualDownActive.load(std::memory_order_acquire))
+            {
+                ScheduleVirtualUp(kVirtualUpDelayMs);
+            }
         }
 
         HWND GetStartWindow() const
@@ -514,11 +586,12 @@ namespace KeyRepeatAssist
 
         std::atomic<bool> m_stopRequested;
         std::atomic<bool> m_physicalDown;
-        std::atomic<bool> m_correctionUpPending;
+        std::atomic<bool> m_virtualDownActive;
+        std::atomic<bool> m_virtualUpPending;
 
+        std::atomic<ULONGLONG> m_virtualUpDueTick;
         std::atomic<ULONGLONG> m_keyEpoch;
         std::atomic<ULONG_PTR> m_startWindowValue;
-        std::atomic<ULONGLONG> m_lastPhysicalUpCounter;
     };
 
     static RepeatKeyWorker g_workers[4];
@@ -631,7 +704,7 @@ namespace KeyRepeatAssist
         config.rawSpeed = keyboardSpeed;
         config.rawDelay = keyboardDelay;
         config.repeatPeriodMs = CalculateRepeatPeriodMs(keyboardSpeed);
-        config.delayMs = CalculateDelayMs(keyboardDelay) + config.repeatPeriodMs;
+        config.delayMs = CalculateDelayMs(keyboardDelay);
 
         return config;
     }
@@ -703,8 +776,6 @@ namespace KeyRepeatAssist
 
             if (!IsSelfInjectedKeyboardEvent(keyInfo))
             {
-                ULONGLONG hookCounter = ReadCounter();
-
                 PauseAssistForPhysicalInput();
 
                 RepeatKeyWorker* worker = FindWorkerByVkCode(keyInfo->vkCode);
@@ -717,7 +788,7 @@ namespace KeyRepeatAssist
                     }
                     else if (IsKeyUpMessage(wParam))
                     {
-                        worker->NotifyPhysicalUp(hookCounter);
+                        worker->NotifyPhysicalUp();
                     }
                 }
 

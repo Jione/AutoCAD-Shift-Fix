@@ -6,18 +6,10 @@
 
 namespace AcadShiftPulseAssist
 {
-    enum AssistGateState
-    {
-        AssistGateRunning = 0,
-        AssistGatePaused = 1
-    };
-
     struct KeyboardTimingConfig
     {
         DWORD delayMs;
-        DWORD repeatPeriodMs;
         int rawDelay;
-        int rawSpeed;
     };
 
     struct PulseKeyProfile
@@ -30,33 +22,20 @@ namespace AcadShiftPulseAssist
     struct PulseSnapshot
     {
         ULONGLONG keyEpoch;
-        ULONGLONG inputEpoch;
-        ULONGLONG gateEpoch;
         HWND startWindow;
     };
-
-    static const bool kCorrectOverlappedSend = false;
 
     static const wchar_t* kSingleInstanceMutexName =
         L"Local\\AcadShiftPulseAssist_SingleInstance";
 
-    static std::atomic<LONG> g_gateState(AssistGateRunning);
-    static std::atomic<ULONGLONG> g_gateEpoch(0);
-    static std::atomic<ULONGLONG> g_inputEpoch(0);
-
     static const ULONG_PTR kAssistExtraInfo = 0x53485250UL;
+    static const DWORD kVirtualUpDelayMs = 10;
+    static const DWORD kVirtualUpRetryMs = 10;
 
     static HHOOK g_keyboardHook = NULL;
     static HANDLE g_singleInstanceMutex = NULL;
 
     static KeyboardTimingConfig g_timing = {};
-
-    static ULONGLONG ReadCounter()
-    {
-        LARGE_INTEGER value = {};
-        QueryPerformanceCounter(&value);
-        return static_cast<ULONGLONG>(value.QuadPart);
-    }
 
     static bool IsAllowedForegroundWindow(HWND windowHandle);
 
@@ -74,10 +53,11 @@ namespace AcadShiftPulseAssist
             m_physicalDown(false),
             m_nativeRepeatSeen(false),
             m_pulseSent(false),
-            m_correctionUpPending(false),
+            m_virtualDownActive(false),
+            m_virtualUpPending(false),
+            m_virtualUpDueTick(0),
             m_keyEpoch(0),
-            m_startWindowValue(0),
-            m_lastPhysicalUpCounter(0)
+            m_startWindowValue(0)
         {
         }
 
@@ -92,10 +72,11 @@ namespace AcadShiftPulseAssist
             m_physicalDown.store(false, std::memory_order_release);
             m_nativeRepeatSeen.store(false, std::memory_order_release);
             m_pulseSent.store(false, std::memory_order_release);
-            m_correctionUpPending.store(false, std::memory_order_release);
+            m_virtualDownActive.store(false, std::memory_order_release);
+            m_virtualUpPending.store(false, std::memory_order_release);
+            m_virtualUpDueTick.store(0, std::memory_order_release);
             m_keyEpoch.store(0, std::memory_order_release);
             m_startWindowValue.store(0, std::memory_order_release);
-            m_lastPhysicalUpCounter.store(0, std::memory_order_release);
 
             m_wakeEvent = CreateEventW(NULL, FALSE, FALSE, NULL);
             if (m_wakeEvent == NULL)
@@ -166,10 +147,18 @@ namespace AcadShiftPulseAssist
                     reinterpret_cast<ULONG_PTR>(foregroundWindow),
                     std::memory_order_release);
 
-                m_lastPhysicalUpCounter.store(0, std::memory_order_release);
-                m_nativeRepeatSeen.store(false, std::memory_order_release);
-                m_pulseSent.store(false, std::memory_order_release);
-                m_correctionUpPending.store(false, std::memory_order_release);
+                if (!m_virtualDownActive.load(std::memory_order_acquire) &&
+                    !m_virtualUpPending.load(std::memory_order_acquire))
+                {
+                    m_nativeRepeatSeen.store(false, std::memory_order_release);
+                    m_pulseSent.store(false, std::memory_order_release);
+                }
+                else
+                {
+                    m_nativeRepeatSeen.store(true, std::memory_order_release);
+                    m_pulseSent.store(true, std::memory_order_release);
+                }
+
                 m_physicalDown.store(true, std::memory_order_release);
                 m_keyEpoch.fetch_add(1, std::memory_order_acq_rel);
 
@@ -183,12 +172,16 @@ namespace AcadShiftPulseAssist
             Wake();
         }
 
-        void NotifyPhysicalUp(ULONGLONG hookCounter)
+        void NotifyPhysicalUp()
         {
-            m_lastPhysicalUpCounter.store(hookCounter, std::memory_order_release);
             m_physicalDown.store(false, std::memory_order_release);
             m_startWindowValue.store(0, std::memory_order_release);
             m_keyEpoch.fetch_add(1, std::memory_order_acq_rel);
+
+            if (m_virtualDownActive.load(std::memory_order_acquire))
+            {
+                ScheduleVirtualUp(kVirtualUpDelayMs);
+            }
 
             Wake();
         }
@@ -205,24 +198,63 @@ namespace AcadShiftPulseAssist
         {
             while (!m_stopRequested.load(std::memory_order_acquire))
             {
-                WaitForSingleObject(m_wakeEvent, INFINITE);
+                FlushVirtualUpIfDue();
+
+                DWORD waitMs = GetThreadWaitMs();
+                WaitForSingleObject(m_wakeEvent, waitMs);
 
                 if (m_stopRequested.load(std::memory_order_acquire))
                 {
                     break;
                 }
 
+                FlushVirtualUpIfDue();
                 ProcessCurrentState();
             }
 
-            FlushCorrectionUpIfNeeded();
+            if (m_virtualDownActive.load(std::memory_order_acquire))
+            {
+                SendSyntheticUp();
+                m_virtualDownActive.store(false, std::memory_order_release);
+                m_virtualUpPending.store(false, std::memory_order_release);
+            }
+        }
+
+        DWORD GetThreadWaitMs() const
+        {
+            if (!m_virtualUpPending.load(std::memory_order_acquire))
+            {
+                return INFINITE;
+            }
+
+            ULONGLONG nowTick = GetTickCount64();
+            ULONGLONG dueTick =
+                m_virtualUpDueTick.load(std::memory_order_acquire);
+
+            if (nowTick >= dueTick)
+            {
+                return 0;
+            }
+
+            ULONGLONG delta = dueTick - nowTick;
+            if (delta > 0x7FFFFFFFUL)
+            {
+                return 0x7FFFFFFF;
+            }
+
+            return static_cast<DWORD>(delta);
         }
 
         void ProcessCurrentState()
         {
             while (!m_stopRequested.load(std::memory_order_acquire))
             {
-                FlushCorrectionUpIfNeeded();
+                FlushVirtualUpIfDue();
+
+                if (m_virtualUpPending.load(std::memory_order_acquire))
+                {
+                    return;
+                }
 
                 if (!m_physicalDown.load(std::memory_order_acquire))
                 {
@@ -239,12 +271,6 @@ namespace AcadShiftPulseAssist
                     return;
                 }
 
-                if (g_gateState.load(std::memory_order_acquire) != AssistGateRunning)
-                {
-                    WaitForSingleObject(m_wakeEvent, INFINITE);
-                    continue;
-                }
-
                 PulseSnapshot snapshot = CaptureSnapshot();
                 DWORD delayMs = m_delayMs.load(std::memory_order_acquire);
 
@@ -255,7 +281,7 @@ namespace AcadShiftPulseAssist
                     return;
                 }
 
-                FlushCorrectionUpIfNeeded();
+                FlushVirtualUpIfDue();
 
                 if (waitResult == WAIT_OBJECT_0)
                 {
@@ -268,16 +294,6 @@ namespace AcadShiftPulseAssist
                     continue;
                 }
 
-                if (m_nativeRepeatSeen.load(std::memory_order_acquire))
-                {
-                    return;
-                }
-
-                if (m_pulseSent.load(std::memory_order_acquire))
-                {
-                    return;
-                }
-
                 SendPulseIfSafe(snapshot);
                 return;
             }
@@ -287,8 +303,6 @@ namespace AcadShiftPulseAssist
         {
             PulseSnapshot snapshot = {};
             snapshot.keyEpoch = m_keyEpoch.load(std::memory_order_acquire);
-            snapshot.inputEpoch = g_inputEpoch.load(std::memory_order_acquire);
-            snapshot.gateEpoch = g_gateEpoch.load(std::memory_order_acquire);
             snapshot.startWindow = GetStartWindow();
 
             return snapshot;
@@ -296,21 +310,6 @@ namespace AcadShiftPulseAssist
 
         bool IsSnapshotValid(const PulseSnapshot& snapshot) const
         {
-            if (g_gateState.load(std::memory_order_acquire) != AssistGateRunning)
-            {
-                return false;
-            }
-
-            if (g_gateEpoch.load(std::memory_order_acquire) != snapshot.gateEpoch)
-            {
-                return false;
-            }
-
-            if (g_inputEpoch.load(std::memory_order_acquire) != snapshot.inputEpoch)
-            {
-                return false;
-            }
-
             if (!m_physicalDown.load(std::memory_order_acquire))
             {
                 return false;
@@ -322,6 +321,16 @@ namespace AcadShiftPulseAssist
             }
 
             if (m_pulseSent.load(std::memory_order_acquire))
+            {
+                return false;
+            }
+
+            if (m_virtualDownActive.load(std::memory_order_acquire))
+            {
+                return false;
+            }
+
+            if (m_virtualUpPending.load(std::memory_order_acquire))
             {
                 return false;
             }
@@ -361,34 +370,6 @@ namespace AcadShiftPulseAssist
                 return false;
             }
 
-            ULONGLONG beforeGateEpoch =
-                g_gateEpoch.load(std::memory_order_acquire);
-
-            ULONGLONG beforeInputEpoch =
-                g_inputEpoch.load(std::memory_order_acquire);
-
-            ULONGLONG beforeKeyEpoch =
-                m_keyEpoch.load(std::memory_order_acquire);
-
-            if (beforeGateEpoch != snapshot.gateEpoch ||
-                beforeInputEpoch != snapshot.inputEpoch ||
-                beforeKeyEpoch != snapshot.keyEpoch)
-            {
-                return false;
-            }
-
-            if (g_gateState.load(std::memory_order_acquire) != AssistGateRunning)
-            {
-                return false;
-            }
-
-            ULONGLONG sendBeginCounter = ReadCounter();
-
-            if (!IsSnapshotValid(snapshot))
-            {
-                return false;
-            }
-
             INPUT input = {};
             input.type = INPUT_KEYBOARD;
             input.ki.wVk = 0;
@@ -398,140 +379,78 @@ namespace AcadShiftPulseAssist
             input.ki.dwExtraInfo = kAssistExtraInfo;
 
             UINT sentCount = SendInput(1, &input, sizeof(INPUT));
-            ULONGLONG sendEndCounter = ReadCounter();
-
             if (sentCount != 1)
             {
                 return false;
             }
 
-            ULONGLONG afterGateEpoch =
-                g_gateEpoch.load(std::memory_order_acquire);
-
-            ULONGLONG afterInputEpoch =
-                g_inputEpoch.load(std::memory_order_acquire);
-
-            ULONGLONG afterKeyEpoch =
-                m_keyEpoch.load(std::memory_order_acquire);
-
-            bool changedDuringSend =
-                afterGateEpoch != beforeGateEpoch ||
-                afterInputEpoch != beforeInputEpoch ||
-                afterKeyEpoch != beforeKeyEpoch;
-
+            m_virtualDownActive.store(true, std::memory_order_release);
             m_pulseSent.store(true, std::memory_order_release);
-
-            if (changedDuringSend)
-            {
-                RequestCorrectionIfSendAfterPhysicalUp(
-                    sendBeginCounter,
-                    sendEndCounter);
-
-                return false;
-            }
-
-            if (!IsSnapshotValidAfterPulse(snapshot))
-            {
-                RequestCorrectionIfSendAfterPhysicalUp(
-                    sendBeginCounter,
-                    sendEndCounter);
-
-                return false;
-            }
-
-            return true;
-        }
-
-        bool IsSnapshotValidAfterPulse(const PulseSnapshot& snapshot) const
-        {
-            if (g_gateState.load(std::memory_order_acquire) != AssistGateRunning)
-            {
-                return false;
-            }
-
-            if (g_gateEpoch.load(std::memory_order_acquire) != snapshot.gateEpoch)
-            {
-                return false;
-            }
-
-            if (g_inputEpoch.load(std::memory_order_acquire) != snapshot.inputEpoch)
-            {
-                return false;
-            }
 
             if (!m_physicalDown.load(std::memory_order_acquire))
             {
-                return false;
+                ScheduleVirtualUp(kVirtualUpDelayMs);
+                return true;
             }
 
-            if (m_keyEpoch.load(std::memory_order_acquire) != snapshot.keyEpoch)
+            if ((GetAsyncKeyState(static_cast<int>(m_vkCode)) & 0x8000) == 0)
             {
-                return false;
-            }
-
-            if (snapshot.startWindow == NULL)
-            {
-                return false;
-            }
-
-            if (GetForegroundWindow() != snapshot.startWindow)
-            {
-                return false;
-            }
-
-            if (!IsAllowedForegroundWindow(snapshot.startWindow))
-            {
-                return false;
+                ScheduleVirtualUp(kVirtualUpDelayMs);
+                return true;
             }
 
             return true;
         }
 
-        void RequestCorrectionIfSendAfterPhysicalUp(
-            ULONGLONG sendBeginCounter,
-            ULONGLONG sendEndCounter)
+        void ScheduleVirtualUp(DWORD delayMs)
         {
-            if (m_physicalDown.load(std::memory_order_acquire))
+            if (!m_virtualDownActive.load(std::memory_order_acquire))
             {
                 return;
             }
 
-            ULONGLONG physicalUpCounter =
-                m_lastPhysicalUpCounter.load(std::memory_order_acquire);
+            ULONGLONG dueTick = GetTickCount64() + delayMs;
 
-            if (physicalUpCounter == 0)
-            {
-                return;
-            }
+            m_virtualUpDueTick.store(dueTick, std::memory_order_release);
+            m_virtualUpPending.store(true, std::memory_order_release);
 
-            bool clearlyAfterUp = sendBeginCounter >= physicalUpCounter;
-            bool overlappedWithUp =
-                sendBeginCounter < physicalUpCounter &&
-                sendEndCounter >= physicalUpCounter;
-
-            if (clearlyAfterUp || (kCorrectOverlappedSend && overlappedWithUp))
-            {
-                m_correctionUpPending.store(true, std::memory_order_release);
-                Wake();
-            }
+            Wake();
         }
 
-        void FlushCorrectionUpIfNeeded()
+        bool FlushVirtualUpIfDue()
         {
-            if (m_physicalDown.load(std::memory_order_acquire))
+            if (!m_virtualUpPending.load(std::memory_order_acquire))
             {
-                m_correctionUpPending.store(false, std::memory_order_release);
-                return;
+                return false;
             }
 
-            bool needCorrection =
-                m_correctionUpPending.exchange(false, std::memory_order_acq_rel);
+            ULONGLONG nowTick = GetTickCount64();
+            ULONGLONG dueTick =
+                m_virtualUpDueTick.load(std::memory_order_acquire);
 
-            if (!needCorrection)
+            if (nowTick < dueTick)
             {
-                return;
+                return false;
             }
 
+            if (SendSyntheticUp())
+            {
+                m_virtualDownActive.store(false, std::memory_order_release);
+                m_virtualUpPending.store(false, std::memory_order_release);
+                m_virtualUpDueTick.store(0, std::memory_order_release);
+                return true;
+            }
+
+            m_virtualUpDueTick.store(
+                GetTickCount64() + kVirtualUpRetryMs,
+                std::memory_order_release);
+
+            Wake();
+            return false;
+        }
+
+        bool SendSyntheticUp()
+        {
             INPUT input = {};
             input.type = INPUT_KEYBOARD;
             input.ki.wVk = 0;
@@ -544,7 +463,8 @@ namespace AcadShiftPulseAssist
             input.ki.time = 0;
             input.ki.dwExtraInfo = kAssistExtraInfo;
 
-            SendInput(1, &input, sizeof(INPUT));
+            UINT sentCount = SendInput(1, &input, sizeof(INPUT));
+            return sentCount == 1;
         }
 
         void CancelHoldIfForegroundChanged(HWND startWindow)
@@ -562,6 +482,11 @@ namespace AcadShiftPulseAssist
             m_physicalDown.store(false, std::memory_order_release);
             m_keyEpoch.fetch_add(1, std::memory_order_acq_rel);
             m_startWindowValue.store(0, std::memory_order_release);
+
+            if (m_virtualDownActive.load(std::memory_order_acquire))
+            {
+                ScheduleVirtualUp(kVirtualUpDelayMs);
+            }
         }
 
         HWND GetStartWindow() const
@@ -586,11 +511,12 @@ namespace AcadShiftPulseAssist
         std::atomic<bool> m_physicalDown;
         std::atomic<bool> m_nativeRepeatSeen;
         std::atomic<bool> m_pulseSent;
-        std::atomic<bool> m_correctionUpPending;
+        std::atomic<bool> m_virtualDownActive;
+        std::atomic<bool> m_virtualUpPending;
 
+        std::atomic<ULONGLONG> m_virtualUpDueTick;
         std::atomic<ULONGLONG> m_keyEpoch;
         std::atomic<ULONG_PTR> m_startWindowValue;
-        std::atomic<ULONGLONG> m_lastPhysicalUpCounter;
     };
 
     static PulseKeyWorker g_workers[2];
@@ -640,9 +566,13 @@ namespace AcadShiftPulseAssist
         {
             return true;
         }
-        
-        if (int i = fileName[0]) {
-            if (_wcsnicmp(&fileName[(((i & 0xDF) == 0x5A) ? 2 : 1)], L"cad.exe", 8) == 0)
+
+        if (int i = fileName[0])
+        {
+            if (_wcsnicmp(
+                &fileName[(((i & 0xDF) == 0x5A) ? 2 : 1)],
+                L"cad.exe",
+                8) == 0)
             {
                 return true;
             }
@@ -762,32 +692,15 @@ namespace AcadShiftPulseAssist
         return static_cast<DWORD>((safeDelay + 1) * 250);
     }
 
-    static DWORD CalculateRepeatPeriodMs(int keyboardSpeed)
-    {
-        int safeSpeed = ClampInt(keyboardSpeed, 0, 31);
-
-        int hwValue = 31 - safeSpeed;
-        int exponent = hwValue >> 3;
-        int mantissa = hwValue & 7;
-        int baseDelay = (8 + mantissa) << exponent;
-        int periodMs = (baseDelay * 25 + 3) / 6;
-
-        return static_cast<DWORD>(periodMs);
-    }
-
     static KeyboardTimingConfig LoadKeyboardTimingConfig()
     {
         KeyboardTimingConfig config = {};
 
-        int keyboardSpeed = 31;
         int keyboardDelay = 1;
 
-        ReadKeyboardRegistryValue(L"KeyboardSpeed", 31, &keyboardSpeed);
         ReadKeyboardRegistryValue(L"KeyboardDelay", 1, &keyboardDelay);
 
-        config.rawSpeed = keyboardSpeed;
         config.rawDelay = keyboardDelay;
-        config.repeatPeriodMs = CalculateRepeatPeriodMs(keyboardSpeed);
         config.delayMs = CalculateDelayMs(keyboardDelay);
 
         return config;
@@ -821,96 +734,6 @@ namespace AcadShiftPulseAssist
     {
         return messageValue == WM_KEYUP ||
             messageValue == WM_SYSKEYUP;
-    }
-
-    static void WakeAllWorkers()
-    {
-        for (int index = 0; index < 2; ++index)
-        {
-            g_workers[index].Wake();
-        }
-    }
-
-    static void PauseAssistForPhysicalInput()
-    {
-        g_gateState.store(AssistGatePaused, std::memory_order_release);
-        g_gateEpoch.fetch_add(1, std::memory_order_acq_rel);
-        g_inputEpoch.fetch_add(1, std::memory_order_acq_rel);
-
-        WakeAllWorkers();
-    }
-
-    static void ResumeAssistAfterPhysicalInput()
-    {
-        g_gateEpoch.fetch_add(1, std::memory_order_acq_rel);
-        g_gateState.store(AssistGateRunning, std::memory_order_release);
-
-        WakeAllWorkers();
-    }
-
-    static LRESULT CALLBACK KeyboardHookProc(
-        int code,
-        WPARAM wParam,
-        LPARAM lParam)
-    {
-        if (code == HC_ACTION)
-        {
-            const KBDLLHOOKSTRUCT* keyInfo =
-                reinterpret_cast<const KBDLLHOOKSTRUCT*>(lParam);
-
-            if (!IsSelfInjectedKeyboardEvent(keyInfo))
-            {
-                ULONGLONG hookCounter = ReadCounter();
-
-                PauseAssistForPhysicalInput();
-
-                PulseKeyWorker* worker = FindWorkerByVkCode(keyInfo->vkCode);
-
-                if (worker != NULL)
-                {
-                    if (IsKeyDownMessage(wParam))
-                    {
-                        HWND foregroundWindow = GetForegroundWindow();
-                        bool allowedWindow =
-                            IsAllowedForegroundWindow(foregroundWindow);
-
-                        worker->NotifyPhysicalDown(
-                            foregroundWindow,
-                            allowedWindow);
-                    }
-                    else if (IsKeyUpMessage(wParam))
-                    {
-                        worker->NotifyPhysicalUp(hookCounter);
-                    }
-                }
-
-                ResumeAssistAfterPhysicalInput();
-            }
-        }
-
-        return CallNextHookEx(g_keyboardHook, code, wParam, lParam);
-    }
-
-    static bool CreateSingleInstanceMutex()
-    {
-        g_singleInstanceMutex = CreateMutexW(
-            NULL,
-            TRUE,
-            kSingleInstanceMutexName);
-
-        if (g_singleInstanceMutex == NULL)
-        {
-            return false;
-        }
-
-        if (GetLastError() == ERROR_ALREADY_EXISTS)
-        {
-            CloseHandle(g_singleInstanceMutex);
-            g_singleInstanceMutex = NULL;
-            return false;
-        }
-
-        return true;
     }
 
     static bool StartWorkers()
@@ -953,6 +776,65 @@ namespace AcadShiftPulseAssist
                 g_workerStarted[index] = false;
             }
         }
+    }
+
+    static LRESULT CALLBACK KeyboardHookProc(
+        int code,
+        WPARAM wParam,
+        LPARAM lParam)
+    {
+        if (code == HC_ACTION)
+        {
+            const KBDLLHOOKSTRUCT* keyInfo =
+                reinterpret_cast<const KBDLLHOOKSTRUCT*>(lParam);
+
+            if (!IsSelfInjectedKeyboardEvent(keyInfo))
+            {
+                PulseKeyWorker* worker = FindWorkerByVkCode(keyInfo->vkCode);
+
+                if (worker != NULL)
+                {
+                    if (IsKeyDownMessage(wParam))
+                    {
+                        HWND foregroundWindow = GetForegroundWindow();
+                        bool allowedWindow =
+                            IsAllowedForegroundWindow(foregroundWindow);
+
+                        worker->NotifyPhysicalDown(
+                            foregroundWindow,
+                            allowedWindow);
+                    }
+                    else if (IsKeyUpMessage(wParam))
+                    {
+                        worker->NotifyPhysicalUp();
+                    }
+                }
+            }
+        }
+
+        return CallNextHookEx(g_keyboardHook, code, wParam, lParam);
+    }
+
+    static bool CreateSingleInstanceMutex()
+    {
+        g_singleInstanceMutex = CreateMutexW(
+            NULL,
+            TRUE,
+            kSingleInstanceMutexName);
+
+        if (g_singleInstanceMutex == NULL)
+        {
+            return false;
+        }
+
+        if (GetLastError() == ERROR_ALREADY_EXISTS)
+        {
+            CloseHandle(g_singleInstanceMutex);
+            g_singleInstanceMutex = NULL;
+            return false;
+        }
+
+        return true;
     }
 
     static bool InstallKeyboardHook(HINSTANCE instanceHandle)

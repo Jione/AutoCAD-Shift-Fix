@@ -2,7 +2,7 @@
 #define PRODUCT_NAME "Key Repeat Assist"
 #define DESCRIPTION  "Held-Key Repeating Fix"
 #define ORIGIN_NAME  "KeyRepeatAssist.exe"
-#define FILE_VERSION "2.0.1.0"
+#define FILE_VERSION "2.0.3.0"
 #define COPYRIGHT    "Jiwon Kim"
 
 // Application Icon
@@ -11,8 +11,8 @@
 LANGUAGE LANG_ENGLISH, SUBLANG_ENGLISH_US
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 2,0,1,0
- PRODUCTVERSION 2,0,1,0
+ FILEVERSION 2,0,3,0
+ PRODUCTVERSION 2,0,3,0
  FILEFLAGSMASK 0x3fL
 #ifdef _DEBUG
  FILEFLAGS 0x1L
